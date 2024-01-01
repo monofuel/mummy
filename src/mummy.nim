@@ -357,8 +357,10 @@ proc respond*(
   # This is usually not set by the caller, however it needs to be for HEAD
   # responses where there is a Content-Length but no body
   if "Content-Length" notin headers:
+    let isChunked = "Transfer-Encoding" in headers and
+      headers.headerContainsToken("Transfer-Encoding", "chunked")
     let shoulAddContentLengthHeader =
-      statusCode != 204 and (statusCode < 100 or statusCode >= 200)
+      statusCode != 204 and (statusCode < 100 or statusCode >= 200) and not isChunked
     # Do not add a Content-Length header for a 204 or 1xx response
     # See RFC 7230 3.3.2
     if shoulAddContentLengthHeader or body.len > 0:
