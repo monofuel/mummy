@@ -359,11 +359,12 @@ proc respond*(
   if "Content-Length" notin headers:
     let isChunked = "Transfer-Encoding" in headers and
       headers.headerContainsToken("Transfer-Encoding", "chunked")
+
     let shoulAddContentLengthHeader =
-      statusCode != 204 and (statusCode < 100 or statusCode >= 200) and not isChunked
+      statusCode != 204 and (statusCode < 100 or statusCode >= 200)
     # Do not add a Content-Length header for a 204 or 1xx response
     # See RFC 7230 3.3.2
-    if shoulAddContentLengthHeader or body.len > 0:
+    if (shoulAddContentLengthHeader or body.len > 0) and not isChunked:
       headers["Content-Length"] = $body.len
 
   encodedResponse.buffer1 = encodeHeaders(statusCode, headers)
