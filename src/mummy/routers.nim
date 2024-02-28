@@ -1,4 +1,6 @@
-import mummy, std/strutils
+import ../mummy, std/strutils, webby/urls
+
+export queryparams
 
 type
   Router* = object
@@ -28,28 +30,45 @@ proc addRoute*(
   ## they were added. The handler for the first matching route is called.
   ## The route path can have `*` and `**` wildcards.
   ## The `*` wildcard represents 0 or more characters, excluding `/`.
-  ## The `**` wildcard represents 1 or more path elements delimited by `/`.
+  ## Valid uses are:
+  ##   "/*"              (wildcard path segment)
+  ##   "/*.json"         (wildcard prefix)
+  ##   "/page_*"         (wildcard suffix)
+  ##   "/*_something_*"  (wildcard prefix and suffix)
+  ## The `**` wildcard represents 1 or more path segments delimited by `/`.
+  ## Valid uses are:
+  ##   "/**"             (wildcard path)
+  ##   "/**/thing"       (wildcard path with suffix)
+  ##   "/thing/**         (wildcard path with prefix)
+  ## See tests/test_routers.nim for more complex routing examples.
 
   when route is static string:
     when route == "":
       {.error: "Invalid empty route".}
     when route[0] != '/':
       {.error: "Routes must begin with /".}
+  else:
+    if route == "":
+      raise newException(MummyError, "Invalid empty route")
+    elif route[0] != '/':
+      raise newException(MummyError, "Routes must begin with /")
 
   var parts = route.split('/')
   parts.delete(0)
 
   var i: int
-  while i < parts.len:
+  while i < parts.len - 1:
     if parts[i] == "**":
       var j = i + 1
-      if j < parts.len and (parts[j] == "*" or parts[j] == "**"):
+      if (
+        parts[j] == "*" or
+        parts[j] == "**" or
+        (parts[j].len >= 2 and parts[j].startsWith('@'))
+      ):
         raise newException(
           MummyError,
-          "Route ** followed by another * or ** is not supported"
+          "Route ** followed by another *, ** or named param is not supported"
         )
-      else:
-        break
     inc i
 
   router.routes.add(Route(
@@ -139,7 +158,7 @@ proc defaultMethodNotAllowedHandler(request: Request) =
     request.respond(405, headers, body)
 
 proc isPartialWildcard(test: string): bool {.inline.} =
-  test.len > 2 and test.startsWith('*') or test.endsWith('*')
+  test.len >= 2 and test.startsWith('*') or test.endsWith('*')
 
 proc partialWildcardMatches(partialWildcard, test: string): bool {.inline.} =
   let
@@ -177,24 +196,6 @@ proc partialWildcardMatches(partialWildcard, test: string): bool {.inline.} =
   let literal = partialWildcard[1 .. ^2]
   return literal in test
 
-proc pathParts(uri: string): seq[string] =
-  # The URI path is assumed to end at the first ? & #
-  var
-    a = uri.find('?')
-    b = uri.find('#')
-  var len = uri.len
-  if a != -1:
-    len = min(len, a)
-  if b != -1:
-    len = min(len, b)
-
-  if len != uri.len:
-    result = uri[0 ..< len].split('/')
-  else:
-    result = uri.split('/')
-
-  result.delete(0)
-
 proc toHandler*(router: Router): RequestHandler =
   return proc(request: Request) =
     ## All requests arrive here to be routed
@@ -205,30 +206,39 @@ proc toHandler*(router: Router): RequestHandler =
       else:
         defaultNotFoundHandler(request)
 
-    if request.uri.len > 0 and request.uri[0] != '/' and ':' in request.uri:
+    if request.path.len == 0 or request.path[0] != '/':
       notFound()
       return
 
     try:
-      let uriParts = request.uri.pathParts()
+      let pathParts = block:
+        var tmp = request.path.split('/')
+        tmp.delete(0)
+        tmp
 
       var matchedSomeRoute: bool
       for route in router.routes:
-        if route.parts.len > uriParts.len:
+        if route.parts.len > pathParts.len:
           continue
+
+        request.pathParams.setLen(0)
 
         var
           i: int
           matchedRoute = true
           atLeastOneMultiWildcardMatch = false
-        for j, part in uriParts:
+        for j, part in pathParts:
           if i >= route.parts.len:
             matchedRoute = false
             break
 
-          if route.parts[i] == "*": # Wildcard
+          if route.parts[i] == "*": # Wildcard segment
             inc i
-          elif route.parts[i] == "**": # Multi-part wildcard
+          elif route.parts[i].len >= 2 and route.parts[i].startsWith('@'):
+            # Named path parameter
+            request.pathParams.add((route.parts[i][1 .. ^1], part))
+            inc i
+          elif route.parts[i] == "**": # Multi-segment wildcard
             # Do we have a required next literal?
             if i + 1 < route.parts.len and atLeastOneMultiWildcardMatch:
               let matchesNextLiteral =
@@ -239,7 +249,7 @@ proc toHandler*(router: Router): RequestHandler =
               if matchesNextLiteral:
                 i += 2
                 atLeastOneMultiWildcardMatch = false
-              elif j == uriParts.high:
+              elif j == pathParts.high:
                 matchedRoute = false
                 break
             else:

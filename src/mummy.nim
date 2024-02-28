@@ -1,4 +1,4 @@
-when (NimMajor, NimMinor, NimPatch) < (2, 0, 0):
+when not defined(nimdoc):
   when not defined(gcArc) and not defined(gcOrc):
     {.error: "Using --mm:arc or --mm:orc is required by Mummy.".}
 
@@ -7,22 +7,24 @@ when not compileOption("threads"):
 
 import mummy/common, mummy/internal, std/atomics, std/base64,
     std/cpuinfo, std/deques, std/hashes, std/nativesockets, std/os,
-    std/parseutils, std/random, std/selectors, std/sets, std/sha1, std/strutils,
-    std/tables, std/times, webby/httpheaders, zippy, std/options
+    std/parseutils, std/random, std/selectors, std/sets, crunchy, std/strutils,
+    std/tables, std/times, webby/httpheaders, webby/queryparams, webby/urls,
+    zippy, std/options
 
 when defined(linux):
   when defined(nimdoc):
     # Why am I doing this?
-    from posix import write, TPollfd, POLLIN, poll, close, EAGAIN, O_CLOEXEC, O_NONBLOCK
+    from std/posix import write, TPollfd, POLLIN, poll, close, EAGAIN,
+        O_CLOEXEC, O_NONBLOCK
   else:
-    import posix
+    import std/posix
 
   let SOCK_NONBLOCK
     {.importc: "SOCK_NONBLOCK", header: "<sys/socket.h>".}: cint
 
 import std/locks
 
-export Port, common, httpheaders
+export Port, common, httpheaders, queryparams
 
 const
   listenBacklogLen = 128
@@ -35,12 +37,15 @@ let
 
 type
   RequestObj* = object
-    httpVersion*: HttpVersion
-    httpMethod*: string
-    uri*: string
-    headers*: HttpHeaders
-    body*: string
-    remoteAddress*: string
+    httpVersion*: HttpVersion ## HTTP version from the request line.
+    httpMethod*: string       ## HTTP method from the request line.
+    uri*: string              ## Raw URI from the HTTP request line.
+    path*: string             ## Decoded request URI path.
+    queryParams*: QueryParams ## Decoded request query parameter key-value pairs.
+    pathParams*: PathParams   ## Router named path parameter key-value pairs.
+    headers*: HttpHeaders     ## HTTP headers key-value pairs.
+    body*: string             ## Request body.
+    remoteAddress*: string    ## Network address of the request sender.
     server: Server
     clientSocket: SocketHandle
     clientId: uint64
@@ -88,12 +93,12 @@ type
     taskQueueCond: Cond
     taskQueue: Deque[WorkerTask]
     responseQueue: Deque[OutgoingBuffer]
-    responseQueueLock: Atomic[bool]
+    responseQueueLock: Lock
     sendQueue: Deque[OutgoingBuffer]
-    sendQueueLock: Atomic[bool]
+    sendQueueLock: Lock
     websocketClaimed: Table[WebSocket, bool]
     websocketQueues: Table[WebSocket, Deque[WebSocketUpdate]]
-    websocketQueuesLock: Atomic[bool]
+    websocketQueuesLock: Lock
 
   Server* = ptr ServerObj
 
@@ -104,7 +109,7 @@ type
   DataEntryKind = enum
     ServerSocketEntry, ClientSocketEntry, EventEntry
 
-  DataEntry = ref object
+  DataEntry {.acyclic.} = ref object
     case kind: DataEntryKind:
     of ServerSocketEntry:
       discard
@@ -124,11 +129,15 @@ type
       requestCounter: int # Incoming request incs, outgoing response decs
 
   IncomingRequestState = object
-    headersParsed, chunked: bool
+    headersParsed: bool
+    chunked: bool
     loggedUnexpectedData: bool
     contentLength: int
     httpVersion: HttpVersion
-    httpMethod, uri: string
+    httpMethod: string
+    uri: string
+    path: string
+    queryParams: QueryParams
     headers: HttpHeaders
     body: string
 
@@ -159,15 +168,6 @@ proc `$`*(request: Request): string =
 
 proc `$`*(websocket: WebSocket): string =
   "WebSocket " & $cast[uint](hash(websocket))
-
-template withLock(lock: var Atomic[bool], body: untyped): untyped =
-  # TAS
-  while lock.exchange(true, moAcquire): # Until we get the lock
-    discard
-  try:
-    body
-  finally:
-    lock.store(false, moRelease)
 
 proc log(server: Server, level: LogLevel, args: varargs[string]) =
   if server.logHandler == nil:
@@ -396,7 +396,10 @@ proc upgradeToWebSocket*(
 ): WebSocket {.raises: [MummyError], gcsafe.} =
   ## Upgrades the request to a WebSocket connection. You can immediately start
   ## calling send().
-
+  ## Future updates for this WebSocket will be calls to the websocketHandler
+  ## provided to `newServer`. The first event will be onOpen.
+  ## Note: if the client disconnects before receiving this upgrade response,
+  ## no onOpen event will be received.
   if not request.headers.headerContainsToken("Connection", "Upgrade"):
     raise newException(
       MummyError,
@@ -431,8 +434,7 @@ proc upgradeToWebSocket*(
     clientId: request.clientId
   )
 
-  let hash =
-    secureHash(websocketKey & "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").Sha1Digest
+  let hash = sha1(websocketKey & "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
   var headers: HttpHeaders
   headers["Connection"] = "Upgrade"
@@ -498,6 +500,9 @@ proc workerProc(server: Server) {.raises: [].} =
         if update.get.event == CloseEvent:
           break
 
+  when defined(mummyCheck22398):
+    var loggedExceptionLeak: bool
+
   while true:
     acquire(server.taskQueueLock)
 
@@ -512,6 +517,12 @@ proc workerProc(server: Server) {.raises: [].} =
     release(server.taskQueueLock)
 
     runTask(task)
+
+    when defined(mummyCheck22398):
+      # https://github.com/nim-lang/Nim/issues/22398
+      if not loggedExceptionLeak and getCurrentExceptionMsg() != "":
+        echo "Detected leaked exception: ", getCurrentExceptionMsg()
+        loggedExceptionLeak = true
 
 proc postTask(server: Server, task: WorkerTask) {.raises: [].} =
   withLock server.taskQueueLock:
@@ -735,6 +746,8 @@ proc popRequest(
   result.httpVersion = dataEntry.requestState.httpVersion
   result.httpMethod = move dataEntry.requestState.httpMethod
   result.uri = move dataEntry.requestState.uri
+  result.path = move dataEntry.requestState.path
+  result.queryParams = move dataEntry.requestState.queryParams
   result.headers = move dataEntry.requestState.headers
   result.body = move dataEntry.requestState.body
   result.body.setLen(dataEntry.requestState.contentLength)
@@ -811,6 +824,17 @@ proc afterRecvHttp(
         if space2 == -1:
           return true # Invalid request line, close the connection
         dataEntry.requestState.uri = dataEntry.recvBuf[space1 + 1 ..< space2]
+        try:
+          var url = parseUrl(dataEntry.requestState.uri)
+          dataEntry.requestState.path = move url.path
+          dataEntry.requestState.queryParams = move url.query
+        except:
+          server.log(
+            DebugLevel,
+            "Dropped connection, invalid request URI: " &
+            dataEntry.requestState.uri
+          )
+          return true # Invalid request URI, close the connection
         if dataEntry.recvBuf.find(
           ' ',
           space2 + 1,
@@ -880,7 +904,7 @@ proc afterRecvHttp(
         "Transfer-Encoding", "chunked"
       )
 
-    var foundContentLength: bool
+    var foundContentLength, foundTransferEncoding: bool
     for (k, v) in dataEntry.requestState.headers:
       if cmpIgnoreCase(k, "Content-Length") == 0:
         if foundContentLength:
@@ -891,9 +915,14 @@ proc afterRecvHttp(
           # Found both Transfer-Encoding: chunked and Content-Length headers
           return true # Close the connection
         try:
-          dataEntry.requestState.contentLength = parseInt(v)
+          dataEntry.requestState.contentLength = strictParseInt(v)
         except:
           return true # Parsing Content-Length failed, close the connection
+      elif cmpIgnoreCase(k, "Transfer-Encoding") == 0:
+        if foundTransferEncoding:
+          # This is a second Transfer-Encoding header, not valid
+          return true # Close the connection
+        foundTransferEncoding = true
 
     if dataEntry.requestState.contentLength < 0:
       return true # Invalid Content-Length, close the connection
@@ -946,12 +975,8 @@ proc afterRecvHttp(
       # After we know we've seen the end of the chunk length, parse it
       var chunkLen: int
       try:
-        discard parseHex(
-          dataEntry.recvBuf,
-          chunkLen,
-          0,
-          chunkLenEnd
-        )
+        chunkLen =
+          strictParseHex(dataEntry.recvBuf.toOpenArray(0, chunkLenEnd - 1))
       except:
         return true # Parsing chunk length failed, close the connection
 
@@ -1079,6 +1104,9 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     joinThreads(server.workerThreads)
     deinitLock(server.taskQueueLock)
     deinitCond(server.taskQueueCond)
+    deinitLock(server.responseQueueLock)
+    deinitLock(server.sendQueueLock)
+    deinitLock(server.websocketQueuesLock)
     try:
       server.responseQueued.close()
     except:
@@ -1293,7 +1321,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                 readyKey.fd.SocketHandle.send(
                   outgoingBuffer.buffer1[outgoingBuffer.bytesSent].addr,
                   (outgoingBuffer.buffer1.len - outgoingBuffer.bytesSent).cint,
-                  0
+                  when defined(MSG_NOSIGNAL): MSG_NOSIGNAL else: 0
                 )
               else:
                 let buffer2Pos =
@@ -1301,7 +1329,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                 readyKey.fd.SocketHandle.send(
                   outgoingBuffer.buffer2[buffer2Pos].addr,
                   (outgoingBuffer.buffer2.len - buffer2Pos).cint,
-                  0
+                  when defined(MSG_NOSIGNAL): MSG_NOSIGNAL else: 0
                 )
           if bytesSent > 0:
             outgoingBuffer.bytesSent += bytesSent
@@ -1474,6 +1502,9 @@ proc newServer*(
 
     initLock(result.taskQueueLock)
     initCond(result.taskQueueCond)
+    initLock(result.responseQueueLock)
+    initLock(result.sendQueueLock)
+    initLock(result.websocketQueuesLock)
 
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
